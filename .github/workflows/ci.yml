@@ -1,0 +1,55 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install zsh, fish and shellcheck (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zsh fish shellcheck
+
+      - name: Install fish (macOS)
+        if: runner.os == 'macOS'
+        run: brew install fish
+
+      - name: shellcheck
+        if: runner.os == 'Linux'
+        run: |
+          shellcheck -s sh bin/downloads-guard bin/claude-process-wrapper install.sh
+          shellcheck -s bash shell/guard.sh tests/posix/run.sh
+
+      - name: Python helper compiles
+        if: runner.os != 'Windows'
+        run: python3 -m py_compile lib/jsonmerge.py
+
+      - name: Shell, hook and installer tests
+        if: runner.os != 'Windows'
+        run: bash tests/posix/run.sh
+
+      - name: PowerShell, hook and installer tests (Windows PowerShell 5.1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests\windows\run.ps1
+
+      - name: PowerShell, hook and installer tests (PowerShell 7)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File tests\windows\run.ps1
+
+      - name: OpenCode plugin and Pi extension tests
+        run: node --test "tests/node/*.test.mjs"
