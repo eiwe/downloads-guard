@@ -508,6 +508,16 @@ function Get-ClaudeDenies {
   return $list
 }
 
+function Get-CursorDenies {
+  $fwd = { param($p) $p -replace '\\', '/' }
+  return @("Write($(& $fwd $CursorCli))", "Write($(& $fwd (Join-Path $CursorDir 'hooks.json')))",
+    "Write($(& $fwd (Join-Path $CursorDir 'mcp.json')))", "Write($(& $fwd $DGHome)/**)")
+}
+
+function Get-OpenCodePatterns {
+  return @("$(Get-TildePath $OpenCodeDir)/*", '~/.downloads-guard/*')
+}
+
 function Get-ClaudeOps([string]$CliPath) {
   $h = Get-ClaudeHandler $CliPath
   $prompt = New-Dict @('hooks', (New-List @($h)))
@@ -561,6 +571,7 @@ function Remove-ProfileBlock([string]$File, [bool]$Created) {
   if (-not (Test-Path -LiteralPath $File)) { return }
   $r = Read-TextKeepBom $File
   if (-not $r.Text.Contains($MarkBegin)) { return }
+  if (-not $r.Text.Contains($MarkEnd)) { Warn "$File has the downloads-guard start marker but no end marker; edit it by hand"; return }
   if ($DryRun) { Say "would remove the downloads-guard block from $File"; return }
   $pattern = '(?ms)^' + [regex]::Escape($MarkBegin) + '\r?\n.*?^' + [regex]::Escape($MarkEnd) + '(\r?\n|\z)'
   $new = [regex]::Replace($r.Text, $pattern, '')
@@ -684,6 +695,15 @@ function Invoke-UninstallFromManifest {
   }
 }
 
+# Remove the install folder; with --system locks still on this can fail partway.
+function Remove-DGHome {
+  if (-not (Test-Path -LiteralPath $DGHome)) { return }
+  try { Remove-FileChange $DGHome } catch { }
+  if (-not $DryRun -and (Test-Path -LiteralPath $DGHome)) {
+    Die "could not remove $DGHome completely. If the --system locks are on, run 'downloads-guard unlock' from an elevated PowerShell and try again."
+  }
+}
+
 function Invoke-UninstallAll([bool]$KeepConfig) {
   Invoke-UninstallFromManifest
   if (Test-Path -LiteralPath $DGHome) {
@@ -693,27 +713,72 @@ function Invoke-UninstallAll([bool]$KeepConfig) {
         Remove-FileChange $x.FullName
       }
     } else {
-      Remove-FileChange $DGHome
+      Remove-DGHome
     }
   }
 }
 
-# Remove downloads-guard entries without a state file: hook handlers in hook lists, and list
-# items and object keys that carry the marker. Containers emptied by this are removed.
-function Remove-DGMarked($Value, [bool]$UnderHooks) {
-  if ($Value -is [System.Collections.IDictionary]) {
-    foreach ($k in @($Value.Keys)) {
-      if (([string]$k).Contains('downloads-guard')) { $Value.Remove($k); continue }
-      $v = $Value[$k]
-      $isColl = ($v -is [System.Collections.ICollection]) -and -not ($v -is [string])
-      $before = if ($isColl) { $v.Count } else { 0 }
-      Remove-DGMarked $v ($UnderHooks -or $k -eq 'hooks')
-      if ($isColl -and $before -gt 0 -and $v.Count -eq 0) { $Value.Remove($k) }
+# Remove downloads-guard entries without a state file. Hook handlers are found by the marker in
+# their command; deny rules and permission patterns only by their exact value, so a user's own
+# rule that merely mentions downloads-guard is kept. Returns $true when something was removed.
+function Invoke-DGStrip($Doc, [string[]]$Denies, [string[]]$Patterns) {
+  $changed = $false
+  if ($Doc.Contains('hooks') -and ($Doc['hooks'] -is [System.Collections.IDictionary])) {
+    $hooks = $Doc['hooks']
+    foreach ($ev in @($hooks.Keys)) {
+      $lst = $hooks[$ev]
+      if (($lst -is [System.Collections.IList]) -and -not ($lst -is [string])) {
+        $before = (ConvertTo-Json -InputObject $lst -Depth 100 -Compress)
+        Remove-MarkedHooks $lst
+        if ((ConvertTo-Json -InputObject $lst -Depth 100 -Compress) -ne $before) {
+          $changed = $true
+          if ($lst.Count -eq 0) { $hooks.Remove($ev) }
+        }
+      }
     }
-  } elseif (($Value -is [System.Collections.IList]) -and -not ($Value -is [string])) {
-    if ($UnderHooks) { Remove-MarkedHooks $Value }
-    else { for ($i = $Value.Count - 1; $i -ge 0; $i--) { if (Test-HasMarker $Value[$i]) { $Value.RemoveAt($i) } } }
+    if ($changed -and $hooks.Count -eq 0) { $Doc.Remove('hooks') }
   }
+  if ($Denies -and $Doc.Contains('permissions') -and ($Doc['permissions'] -is [System.Collections.IDictionary])) {
+    $perms = $Doc['permissions']
+    if ($perms.Contains('deny') -and ($perms['deny'] -is [System.Collections.IList])) {
+      $lst = $perms['deny']
+      $hit = $false
+      for ($i = $lst.Count - 1; $i -ge 0; $i--) {
+        if (($lst[$i] -is [string]) -and ($Denies -ccontains $lst[$i])) { $lst.RemoveAt($i); $changed = $true; $hit = $true }
+      }
+      if ($lst.Count -eq 0 -and $hit) { $perms.Remove('deny'); if ($perms.Count -eq 0) { $Doc.Remove('permissions') } }
+    }
+  }
+  if ($Patterns -and $Doc.Contains('permission') -and ($Doc['permission'] -is [System.Collections.IDictionary])) {
+    $perm = $Doc['permission']
+    if ($perm.Contains('edit') -and ($perm['edit'] -is [System.Collections.IDictionary])) {
+      $edit = $perm['edit']
+      $hitAny = $false
+      foreach ($k in $Patterns) { if ($edit.Contains($k) -and ($edit[$k] -ceq 'deny')) { $edit.Remove($k); $hitAny = $true } }
+      if ($hitAny) {
+        $changed = $true
+        if ($edit.Count -eq 0) {
+          $perm.Remove('edit')
+          # Undo the installer's {"*": X} expansion of a "permission": X shorthand.
+          if ($perm.Count -eq 1 -and $perm.Contains('*') -and ($perm['*'] -is [string])) { $Doc['permission'] = $perm['*'] }
+          elseif ($perm.Count -eq 0) { $Doc.Remove('permission') }
+        }
+      }
+    }
+  }
+  return $changed
+}
+
+# What a file looks like when only downloads-guard's own scaffolding is left; such a file is deleted.
+function Test-DGSkeleton($Doc, [string]$Kind) {
+  $json = ConvertTo-Json -InputObject $Doc -Depth 100 -Compress
+  $skeletons = @{
+    'claude' = @('{}'); 'codex' = @('{}'); 'opencode' = @('{}')
+    'cursor-hooks' = @('{}', '{"version":1}')
+    'cursor-cli' = @('{}', '{"version":1,"editor":{"vimMode":false},"permissions":{"allow":[]}}',
+      '{"version":1,"editor":{"vimMode":false},"permissions":{"allow":[],"deny":[]}}')
+  }
+  return ($skeletons[$Kind] -contains ($json -replace '\s', ''))
 }
 
 # Without an install record (for example after the install folder was deleted by hand), find
@@ -722,16 +787,29 @@ function Remove-DGMarked($Value, [bool]$UnderHooks) {
 function Invoke-FallbackCleanup {
   Say 'No install record found; removing downloads-guard entries from every place the installer writes to.'
   foreach ($p in $ProfilePaths) { Remove-ProfileBlock $p $false }
-  foreach ($f in @((Join-Path $ClaudeDir 'settings.json'), (Join-Path $CodexDir 'hooks.json'), (Join-Path $CursorDir 'hooks.json'),
-      $CursorCli, (Join-Path $OpenCodeDir 'opencode.json'))) {
+  $targets = @(
+    @{ File = (Join-Path $ClaudeDir 'settings.json'); Kind = 'claude'; Denies = (Get-ClaudeDenies); Patterns = @() },
+    @{ File = (Join-Path $CodexDir 'hooks.json'); Kind = 'codex'; Denies = @(); Patterns = @() },
+    @{ File = (Join-Path $CursorDir 'hooks.json'); Kind = 'cursor-hooks'; Denies = @(); Patterns = @() },
+    @{ File = $CursorCli; Kind = 'cursor-cli'; Denies = (Get-CursorDenies); Patterns = @() },
+    @{ File = (Join-Path $OpenCodeDir 'opencode.json'); Kind = 'opencode'; Denies = @(); Patterns = (Get-OpenCodePatterns) })
+  foreach ($t in $targets) {
+    $f = $t.File
     if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { continue }
     $text = [IO.File]::ReadAllText($f, $Utf8)
     if (-not $text.Contains('downloads-guard')) { continue }
     try {
       $doc = Read-JsonText $text $f
-      Remove-DGMarked $doc $false
-      if ($DryRun) { Say "would remove downloads-guard entries from ${f}:"; Say (ConvertTo-JsonText $doc).TrimEnd() }
-      else { Write-TextAtomic $f (ConvertTo-JsonText $doc); Say "removed downloads-guard entries from $f" }
+      if (-not (Invoke-DGStrip $doc ([string[]]$t.Denies) ([string[]]$t.Patterns))) { continue }
+      $skeleton = Test-DGSkeleton $doc $t.Kind
+      if ($DryRun) {
+        if ($skeleton) { Say "would remove $f (only downloads-guard's own scaffolding was left)" }
+        else { Say "would remove downloads-guard entries from ${f}:"; Say (ConvertTo-JsonText $doc).TrimEnd() }
+      } elseif ($skeleton) {
+        Remove-Item -LiteralPath $f -Force; Say "removed $f (only downloads-guard's own scaffolding was left)"
+      } else {
+        Write-TextAtomic $f (ConvertTo-JsonText $doc); Say "removed downloads-guard entries from $f"
+      }
     } catch { Warn "could not clean $f ($($_.Exception.Message)); remove the downloads-guard entries by hand" }
   }
   foreach ($f in @((Join-Path (Join-Path $OpenCodeDir 'plugins') 'downloads-guard.js'), (Join-Path (Join-Path $PiDir 'extensions') 'downloads-guard.ts'))) {
@@ -753,7 +831,7 @@ function Invoke-FallbackCleanup {
 if ($Uninstall) {
   if (-not (Test-Path -LiteralPath $Manifest)) {
     Invoke-FallbackCleanup
-    Remove-FileChange $DGHome
+    Remove-DGHome
     if ($DryRun) { Say 'Dry run: nothing was changed.' } else { Say 'downloads-guard removed. Open a new PowerShell window so the wrappers are gone.' }
     exit 0
   }
@@ -824,14 +902,11 @@ if (Want-Cursor) {
   Install-Json 'cursor-hooks' (Join-Path $CursorDir 'hooks.json') @(
     (New-Op 'set_default' @('version') 1),
     (New-Op 'hook' @('hooks', 'beforeSubmitPrompt') $h))
-  $fwd = { param($p) $p -replace '\\', '/' }
   Install-Json 'cursor-cli' $CursorCli @(
     (New-Op 'set_default' @('version') 1),
     (New-Op 'set_default' @('editor') (New-Dict @('vimMode', $false))),
     (New-Op 'set_default' @('permissions', 'allow') (New-List @())),
-    (New-Op 'array_add' @('permissions', 'deny') @(
-        "Write($(& $fwd $CursorCli))", "Write($(& $fwd (Join-Path $CursorDir 'hooks.json')))",
-        "Write($(& $fwd (Join-Path $CursorDir 'mcp.json')))", "Write($(& $fwd $DGHome)/**)")))
+    (New-Op 'array_add' @('permissions', 'deny') (Get-CursorDenies)))
 }
 if (Want-OpenCode) {
   $plugin = Join-Path (Join-Path $OpenCodeDir 'plugins') 'downloads-guard.js'
@@ -840,7 +915,7 @@ if (Want-OpenCode) {
   Write-FileChange $plugin (Render-Template (Join-Path $Src 'integrations\opencode\downloads-guard.js') $DGHome)
   Add-Record 'file' 'opencode-plugin' $plugin
   $ocJson = Join-Path $OpenCodeDir 'opencode.json'
-  $patterns = @("$(Get-TildePath $OpenCodeDir)/*", '~/.downloads-guard/*')
+  $patterns = Get-OpenCodePatterns
   if ((Test-Path -LiteralPath (Join-Path $OpenCodeDir 'opencode.jsonc')) -and -not (Test-Path -LiteralPath $ocJson)) {
     Warn "$OpenCodeDir\opencode.jsonc has comments that downloads-guard cannot keep; add by hand: `"permission`": {`"edit`": {`"$($patterns[0])`": `"deny`", `"$($patterns[1])`": `"deny`"}}"
   } else {

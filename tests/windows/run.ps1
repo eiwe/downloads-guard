@@ -472,7 +472,8 @@ try {
   Write-Host '# uninstall after the install folder was deleted by hand'
   $H5 = Join-Path $TmpBase 'deleted'
   foreach ($d in @('Downloads\p', '.claude', '.codex', '.cursor', '.config\opencode', '.pi\agent')) { [void](New-Item -ItemType Directory -Path (Join-Path $H5 $d) -Force) }
-  [IO.File]::WriteAllText((Join-Path $H5 '.claude\settings.json'), '{"model":"opus","hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo bye"}]}]},"permissions":{"deny":["Read(./.env)"]}}')
+  [IO.File]::WriteAllText((Join-Path $H5 '.claude\settings.json'), '{"model":"opus","hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo bye"}]}]},"permissions":{"allow":["Bash(downloads-guard status)"],"deny":["Read(./.env)"]}}')
+  [IO.File]::WriteAllText((Join-Path $H5 '.config\opencode\opencode.json'), '{"permission":"allow"}')
   $prof5 = Join-Path $H5 'Documents\PowerShell\profile.ps1'
   [void](New-Item -ItemType Directory -Path (Split-Path $prof5) -Force)
   [IO.File]::WriteAllText($prof5, "`$env:EXISTING = '1'`r`n")
@@ -481,6 +482,12 @@ try {
   $r = Invoke-Proc $PS (@('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $Installer) + $p5) $Work
   Eq 'deleted: install exit 0' 0 $r.Code
   Remove-Item -LiteralPath (Join-Path $H5 '.downloads-guard') -Recurse -Force
+  # A profile whose block lost its end marker (hand-edited) must be left alone.
+  $broken = Join-Path $H5 'Documents\WindowsPowerShell\profile.ps1'
+  [void](New-Item -ItemType Directory -Path (Split-Path $broken) -Force)
+  [IO.File]::WriteAllText($broken, "keep me`r`n# >>> downloads-guard >>>`r`nalso keep me`r`n")
+  $brokenHash = (Get-FileHash -LiteralPath $broken).Hash
+  $p5 = @('--profile-path', $prof5, '--profile-path', $broken)
   $hk5 = (Get-Content -LiteralPath (Join-Path $H5 '.claude\settings.json') -Raw | ConvertFrom-Json).hooks.UserPromptSubmit[0].hooks[0]
   Check 'deleted: the left-over Claude hook now fails (which onFailure:block turns into a block)' ((Invoke-Proc $hk5.command ([string[]]@($hk5.args)) $Work (ClaudePrompt $Work)).Code -notin @(0, 2))
   $B5 = Snapshot $H5
@@ -491,9 +498,18 @@ try {
   Eq 'deleted: --uninstall exit 0' 0 $r.Code
   if ($r.Code -ne 0) { Write-Host $r.Out; Write-Host $r.Err }
   Contains 'deleted: --uninstall says it is cleaning up without a record' $r.Out 'No install record found'
+  Eq 'deleted: a start marker without an end marker leaves the profile byte for byte' $brokenHash (Get-FileHash -LiteralPath $broken).Hash
+  Contains 'deleted: and says to edit it by hand' $r.Err "$broken has the downloads-guard start marker but no end marker"
+  Remove-Item -LiteralPath $broken -Force
   $left = @(Get-ChildItem -LiteralPath $H5 -Recurse -Force -File | Where-Object { $_.FullName -notlike '*\AppData\*' } |
-      Where-Object { [IO.File]::ReadAllText($_.FullName).Contains('downloads-guard') } | ForEach-Object { $_.FullName })
-  Eq 'deleted: no file under the profile mentions downloads-guard any more' '' ($left -join ', ')
+      Where-Object { [IO.File]::ReadAllText($_.FullName) -match '\.downloads-guard|downloads-guard:squat|hook (claude|codex|cursor)' } | ForEach-Object { $_.FullName })
+  Eq 'deleted: no downloads-guard paths, hooks or decoys are left under the profile' '' ($left -join ', ')
+  Contains 'deleted: a user rule that only mentions downloads-guard is kept' ([IO.File]::ReadAllText((Join-Path $H5 '.claude\settings.json'))) 'Bash(downloads-guard status)'
+  Check 'deleted: our Claude deny rules are removed by exact value' (-not ([IO.File]::ReadAllText((Join-Path $H5 '.claude\settings.json')).Contains('Edit(~/.claude.json)')))
+  Check 'deleted: a Codex hooks.json left as {} is removed' (-not (Test-Path -LiteralPath (Join-Path $H5 '.codex\hooks.json')))
+  Check 'deleted: a Cursor hooks.json left as {"version": 1} is removed' (-not (Test-Path -LiteralPath (Join-Path $H5 '.cursor\hooks.json')))
+  Check 'deleted: a Cursor cli-config.json left with only our defaults is removed' (-not (Test-Path -LiteralPath (Join-Path $H5 '.cursor\cli-config.json')))
+  Eq 'deleted: OpenCode permission goes back to the "allow" shorthand' 'allow' (Get-Content -LiteralPath (Join-Path $H5 '.config\opencode\opencode.json') -Raw | ConvertFrom-Json).permission
   $c5 = Get-Content -LiteralPath (Join-Path $H5 '.claude\settings.json') -Raw | ConvertFrom-Json
   Eq 'deleted: Claude keeps the model' 'opus' $c5.model
   Eq 'deleted: Claude keeps its own Stop hook' 'echo bye' $c5.hooks.Stop[0].hooks[0].command
@@ -502,6 +518,27 @@ try {
   Check 'deleted: Pi extension removed' (-not (Test-Path -LiteralPath (Join-Path $H5 '.pi\agent\extensions\downloads-guard.ts')))
   Check 'deleted: decoys removed' (-not (Test-Path -LiteralPath (Join-Path $H5 'Downloads\CLAUDE.md')))
   Eq 'deleted: the profile is back to its own content' "`$env:EXISTING = '1'`r`n" ([IO.File]::ReadAllText($prof5))
+
+  Write-Host '# an install folder that cannot be removed'
+  $H7 = Join-Path $TmpBase 'stuck'
+  [void](New-Item -ItemType Directory -Path (Join-Path $H7 'Downloads') -Force)
+  [void](New-Item -ItemType Directory -Path (Join-Path $H7 '.claude') -Force)
+  $env:USERPROFILE = $H7
+  $p7 = @('--profile-path', (Join-Path $H7 'Documents\PowerShell\profile.ps1'))
+  $r = Invoke-Proc $PS (@('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $Installer) + $p7) $Work
+  Eq 'stuck: install exit 0' 0 $r.Code
+  $heldPath = Join-Path $H7 '.downloads-guard\held.txt'
+  [IO.File]::WriteAllText($heldPath, 'x')
+  $held = [IO.File]::Open($heldPath, 'Open', 'Read', 'None')
+  try {
+    $r = Invoke-Proc $PS (@('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $Installer) + $p7 + @('--uninstall')) $Work
+  } finally { $held.Close() }
+  Check 'stuck: --uninstall exits non-zero when the folder cannot be removed' ($r.Code -ne 0)
+  Contains 'stuck: and names the folder and the lock hint' $r.Err "could not remove $H7\.downloads-guard completely"
+  Check 'stuck: and does not claim it was removed' (-not $r.Out.Contains('downloads-guard removed'))
+  $r = Invoke-Proc $PS (@('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $Installer) + $p7 + @('--uninstall')) $Work
+  Eq 'stuck: once released, --uninstall finishes' 0 $r.Code
+  Check 'stuck: and the folder is gone' (-not (Test-Path -LiteralPath (Join-Path $H7 '.downloads-guard')))
   $env:USERPROFILE = $H
 } catch {
   Bad "unexpected error: $($_.Exception.Message)" ($_.ScriptStackTrace)

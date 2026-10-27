@@ -13,7 +13,8 @@ Usage:
   jsonmerge.py apply  --profile NAME --file PATH --state PATH [profile options] [--dry-run]
   jsonmerge.py revert --state PATH [--dry-run]
   jsonmerge.py render --profile claude-managed --hook-command CMD [--deny RULE ...]
-  jsonmerge.py strip  --file PATH [--dry-run]   (no state file: remove marker-bearing entries)
+  jsonmerge.py strip  --profile NAME --file PATH [--deny RULE ...] [--pattern P ...] [--dry-run]
+                      (no state file: remove our hook entries by marker, rules by exact value)
 """
 
 import argparse
@@ -409,31 +410,75 @@ def cmd_revert(args):
     return 0
 
 
-def strip_marked(value, under_hooks=False):
-    """Remove every downloads-guard entry without a state file: hook handlers in hook lists,
-    list items and object keys that carry the marker. Containers left empty by this are
-    removed. Returns (new_value, changed)."""
-    if isinstance(value, dict):
-        out = {}
-        changed = False
-        for k, v in value.items():
-            if MARKER in k:
+# What a settings file looks like when only downloads-guard's own scaffolding is left. A file
+# that ends up exactly like this after a strip is deleted (it was made by the installer).
+SKELETONS = {
+    "claude": [{}],
+    "codex": [{}],
+    "cursor-hooks": [{}, {"version": 1}],
+    "cursor-cli": [
+        {},
+        {"version": 1, "editor": {"vimMode": False}, "permissions": {"allow": []}},
+        {"version": 1, "editor": {"vimMode": False}, "permissions": {"allow": [], "deny": []}},
+    ],
+    "opencode": [{}],
+}
+
+
+def prune_if_emptied(doc, path):
+    """Delete the container at path if it is empty, then each parent that became empty."""
+    for depth in range(len(path), 0, -1):
+        cur, had = get_path(doc, path[:depth])
+        if had and isinstance(cur, (dict, list)) and len(cur) == 0:
+            del_path(doc, path[:depth])
+        else:
+            break
+
+
+def strip_doc(doc, profile, denies, patterns):
+    """Remove downloads-guard entries without a state file. Hook handlers are found by the
+    marker in their command; deny rules and permission patterns only by their exact value,
+    so a user's own rule that merely mentions downloads-guard is kept. Returns changed."""
+    changed = False
+    hooks, had = get_path(doc, ["hooks"])
+    if had and isinstance(hooks, dict):
+        for event in list(hooks.keys()):
+            lst = hooks[event]
+            if isinstance(lst, list):
+                cleaned, removed = strip_marked_hooks(lst)
+                if removed:
+                    changed = True
+                    if cleaned:
+                        hooks[event] = cleaned
+                    else:
+                        del hooks[event]
+        if changed:
+            prune_if_emptied(doc, ["hooks"])
+    if denies:
+        lst, had = get_path(doc, ["permissions", "deny"])
+        if had and isinstance(lst, list):
+            kept = [v for v in lst if v not in denies]
+            if len(kept) != len(lst):
                 changed = True
-                continue
-            nv, ch = strip_marked(v, under_hooks or k == "hooks")
-            if ch and isinstance(nv, (dict, list)) and len(nv) == 0:
+                lst[:] = kept
+                prune_if_emptied(doc, ["permissions", "deny"])
+    if patterns:
+        edit, had = get_path(doc, ["permission", "edit"])
+        if had and isinstance(edit, dict):
+            hit = [k for k in patterns if edit.get(k) == "deny"]
+            if hit:
                 changed = True
-                continue
-            out[k] = nv
-            changed = changed or ch
-        return out, changed
-    if isinstance(value, list):
-        if under_hooks:
-            cleaned, removed = strip_marked_hooks(value)
-            return cleaned, removed > 0
-        out = [v for v in value if not has_marker(v)]
-        return out, len(out) != len(value)
-    return value, False
+                for k in hit:
+                    del edit[k]
+                if not edit:
+                    del_path(doc, ["permission", "edit"])
+                    perm = doc.get("permission")
+                    # Undo the installer's {"*": X} expansion of a "permission": X shorthand.
+                    if isinstance(perm, dict) and list(perm.keys()) == ["*"] and isinstance(perm["*"], str):
+                        doc["permission"] = perm["*"]
+                    else:
+                        prune_if_emptied(doc, ["permission"])
+    return changed
 
 
 def cmd_strip(args):
@@ -441,15 +486,23 @@ def cmd_strip(args):
     if not os.path.exists(path):
         return 0
     doc = load_json(path)
-    new, changed = strip_marked(doc)
-    if not changed:
+    profile = args.profile or "claude"
+    if not strip_doc(doc, profile, args.deny or [], args.pattern or []):
         return 0
+    remove_file = doc in SKELETONS.get(profile, [{}])
     if args.dry_run:
-        print("would remove downloads-guard entries from %s:" % path)
-        print(json.dumps(new, indent=2, ensure_ascii=False))
+        if remove_file:
+            print("would remove %s (only downloads-guard's own scaffolding was left)" % path)
+        else:
+            print("would remove downloads-guard entries from %s:" % path)
+            print(json.dumps(doc, indent=2, ensure_ascii=False))
         return 0
-    atomic_write_json(path, new, file_mode(path))
-    print("removed downloads-guard entries from %s" % path)
+    if remove_file:
+        os.unlink(path)
+        print("removed %s (only downloads-guard's own scaffolding was left)" % path)
+    else:
+        atomic_write_json(path, doc, file_mode(path))
+        print("removed downloads-guard entries from %s" % path)
     return 0
 
 

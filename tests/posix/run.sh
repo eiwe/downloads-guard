@@ -483,12 +483,16 @@ eq "--system uninstall: HOME restored byte for byte" "$BEFORE" "$(snapshot "$H")
 echo "# uninstall after ~/.downloads-guard was deleted by hand"
 H5="$TMP/deleted"
 mkdir -p "$H5/Downloads/p" "$H5/.claude" "$H5/.codex" "$H5/.cursor" "$H5/.config/opencode" "$H5/.pi/agent" "$H5/.config/fish"
-printf '{"model":"opus","hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo bye"}]}]},"permissions":{"deny":["Read(./.env)"]}}\n' >"$H5/.claude/settings.json"
+printf '{"model":"opus","hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo bye"}]}]},"permissions":{"allow":["Bash(downloads-guard status)"],"deny":["Read(./.env)"]}}\n' >"$H5/.claude/settings.json"
+printf '{"permission":"allow"}\n' >"$H5/.config/opencode/opencode.json"
 printf 'export EXISTING=1\n' >"$H5/.bashrc"
 h5() { env -i HOME="$H5" PATH="$BASEPATH" LANG=C "$@"; }
 h5 sh "$REPO/install.sh" >/dev/null 2>&1
 eq "deleted: install exit 0" 0 $?
 rm -rf "$H5/.downloads-guard"
+# A login file whose block lost its end marker (hand-edited) must be left alone.
+printf 'keep me\n# >>> downloads-guard >>>\nalso keep me\n' >"$H5/.bash_login"
+BROKEN=$(cksum <"$H5/.bash_login")
 cmd=$(py 'import json,sys;print(json.load(open(sys.argv[1]))["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"])' "$H5/.claude/settings.json")
 (cd "$H5" && printf '{"cwd":"%s"}' "$H5" | h5 sh -c "$cmd" >/dev/null 2>&1)
 check "deleted: the left-over Claude hook now fails (which onFailure:block turns into a block)" [ $? -ne 0 ]
@@ -500,8 +504,17 @@ contains "deleted: --uninstall --dry-run names the Claude settings" "$out" "woul
 out=$(h5 sh "$REPO/install.sh" --uninstall 2>&1)
 eq "deleted: --uninstall exit 0" 0 $?
 contains "deleted: --uninstall says it is cleaning up without a record" "$out" "No install record found"
-left=$(grep -rl downloads-guard "$H5" 2>/dev/null)
-eq "deleted: no file under HOME mentions downloads-guard any more" "" "$left"
+eq "deleted: a start marker without an end marker leaves the file byte for byte" "$BROKEN" "$(cksum <"$H5/.bash_login")"
+contains "deleted: and says to edit it by hand" "$out" "$H5/.bash_login has the downloads-guard start marker but no end marker"
+rm -f "$H5/.bash_login"
+left=$(grep -rlE '\.downloads-guard|downloads-guard:squat|hook (claude|codex|cursor)' "$H5" 2>/dev/null)
+eq "deleted: no downloads-guard paths, hooks or decoys are left under HOME" "" "$left"
+contains "deleted: a user rule that only mentions downloads-guard is kept" "$(cat "$H5/.claude/settings.json")" "Bash(downloads-guard status)"
+check "deleted: our Claude deny rules are removed by exact value" sh -c '! grep -q "Edit(~/.claude.json)" "$1"' _ "$H5/.claude/settings.json"
+check "deleted: a Codex hooks.json left as {} is removed" [ ! -e "$H5/.codex/hooks.json" ]
+check "deleted: a Cursor hooks.json left as {\"version\": 1} is removed" [ ! -e "$H5/.cursor/hooks.json" ]
+check "deleted: a Cursor cli-config.json left with only our defaults is removed" [ ! -e "$H5/.cursor/cli-config.json" ]
+eq "deleted: OpenCode permission goes back to the \"allow\" shorthand" "allow" "$(py 'import json,sys;print(json.load(open(sys.argv[1]))["permission"])' "$H5/.config/opencode/opencode.json")"
 eq "deleted: Claude keeps the model" "opus" "$(py 'import json,sys;print(json.load(open(sys.argv[1]))["model"])' "$H5/.claude/settings.json")"
 eq "deleted: Claude keeps its own Stop hook" "echo bye" "$(py 'import json,sys;print(json.load(open(sys.argv[1]))["hooks"]["Stop"][0]["hooks"][0]["command"])' "$H5/.claude/settings.json")"
 eq "deleted: Claude hook events are gone" "absent" "$(py 'import json,sys;print(json.load(open(sys.argv[1]))["hooks"].get("UserPromptSubmit","absent"))' "$H5/.claude/settings.json")"
@@ -513,6 +526,25 @@ check "deleted: decoys removed" sh -c '[ ! -e "$1/CLAUDE.md" ] && [ ! -e "$1/ope
 eq "deleted: .bashrc is back to its own content" "export EXISTING=1" "$(cat "$H5/.bashrc")"
 out=$(h5 sh "$REPO/install.sh" --uninstall 2>&1)
 eq "deleted: a second --uninstall is a no-op" 0 $?
+
+echo "# an install folder that cannot be removed"
+H7="$TMP/stuck"
+mkdir -p "$H7/Downloads" "$H7/.claude"
+h7() { env -i HOME="$H7" PATH="$BASEPATH" LANG=C "$@"; }
+h7 sh "$REPO/install.sh" >/dev/null 2>&1
+eq "stuck: install exit 0" 0 $?
+mkdir -p "$H7/.downloads-guard/held"
+touch "$H7/.downloads-guard/held/file"
+chmod 555 "$H7/.downloads-guard/held"
+out=$(h7 sh "$REPO/install.sh" --uninstall 2>&1)
+rc=$?
+check "stuck: --uninstall exits non-zero when the folder cannot be removed" [ "$rc" -ne 0 ]
+contains "stuck: and names the folder and the lock hint" "$out" "could not remove $H7/.downloads-guard completely"
+check "stuck: and does not claim it was removed" sh -c '! printf "%s" "$1" | grep -q "downloads-guard removed"' _ "$out"
+chmod 755 "$H7/.downloads-guard/held"
+h7 sh "$REPO/install.sh" --uninstall >/dev/null 2>&1
+eq "stuck: once unlocked, --uninstall finishes" 0 $?
+check "stuck: and the folder is gone" [ ! -e "$H7/.downloads-guard" ]
 
 echo
 echo "passed: $PASS  failed: $FAIL"

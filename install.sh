@@ -229,6 +229,10 @@ remove_block() {  # remove_block FILE CREATED(yes|no)
   _f=$1
   [ -f "$_f" ] || return 0
   grep -qF "$MARK_BEGIN" "$_f" || return 0
+  grep -qF "$MARK_END" "$_f" || {
+    warn "$_f has the downloads-guard start marker but no end marker; edit it by hand"
+    return 0
+  }
   if [ $DRY = 1 ]; then
     say "would remove the downloads-guard block from $_f"
     return 0
@@ -322,6 +326,46 @@ EOF
   [ $_any = 1 ] || warn "no Downloads folder exists yet, so no decoy files were placed"
 }
 
+# ------------------------------------------------------------------ rules (install and uninstall)
+
+hook_cmd() { printf '/bin/sh %s hook %s' "$(shq "$1")" "$2"; }
+DG_TILDE=$(tilde "$DG_HOME")
+
+claude_denies() {
+  # Narrow on purpose: memory, projects and everything else under ~/.claude stay writable.
+  printf '%s\n' "Edit(~/.claude.json)"
+  if [ "$CLAUDE_DIR" = "$HOME/.claude" ]; then
+    printf '%s\n' "Edit(~/.claude/settings*.json)"
+  else
+    printf '%s\n' "Edit(/$CLAUDE_DIR/settings*.json)"
+  fi
+  printf '%s\n' "Edit(**/.claude/settings*.json)" "Edit(**/.mcp.json)" "Edit($DG_TILDE/**)"
+}
+
+cursor_denies() {
+  printf '%s\n' "Write($CURSOR_CLI_CONFIG)" "Write($CURSOR_DIR/hooks.json)" "Write($CURSOR_DIR/mcp.json)" "Write($DG_HOME/**)"
+}
+
+opencode_patterns() {
+  printf '%s\n' "$(tilde "$OPENCODE_DIR")/*" "$DG_TILDE/*"
+}
+
+# with_list FLAG GENERATOR CMD...: run CMD with "FLAG LINE" appended for each line GENERATOR prints.
+with_list() {
+  _wl_flag=$1
+  _wl_gen=$2
+  shift 2
+  _old_ifs=$IFS
+  IFS=$NL
+  set -f
+  # shellcheck disable=SC2046 # split on newlines only, globbing off
+  set -- "$@" $($_wl_gen | while IFS= read -r _l; do printf -- '%s\n%s\n' "$_wl_flag" "$_l"; done)
+  IFS=$_old_ifs
+  set +f
+  "$@"
+}
+with_denies() { with_list --deny claude_denies "$@"; }
+
 # ------------------------------------------------------------------ uninstall
 
 uninstall_from_manifest() {
@@ -372,6 +416,15 @@ uninstall_from_manifest() {
     done
 }
 
+# Remove the install folder; with --system locks still on this can fail partway.
+remove_dg_home() {
+  [ -d "$DG_HOME" ] || return 0
+  if ! run rm -rf "$DG_HOME" || { [ $DRY = 0 ] && [ -e "$DG_HOME" ]; }; then
+    warn "could not remove $DG_HOME completely. If the --system locks are on, run 'downloads-guard unlock' (needs sudo) and try again."
+    exit 1
+  fi
+}
+
 uninstall_all() {  # uninstall_all KEEP_CONFIG(0|1)
   uninstall_from_manifest
   if [ -d "$DG_HOME" ]; then
@@ -384,7 +437,7 @@ uninstall_all() {  # uninstall_all KEEP_CONFIG(0|1)
         esac
       done
     else
-      run rm -rf "$DG_HOME"
+      remove_dg_home
     fi
   fi
 }
@@ -397,11 +450,20 @@ fallback_cleanup() {
   for _f in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile" "${ZDOTDIR:-$HOME}/.zshrc"; do
     remove_block "$_f" no
   done
-  for _f in "$CLAUDE_DIR/settings.json" "$CODEX_DIR/hooks.json" "$CURSOR_DIR/hooks.json" "$CURSOR_CLI_CONFIG" "$OPENCODE_DIR/opencode.json"; do
-    if [ -f "$_f" ] && grep -q downloads-guard "$_f"; then
-      jsonmerge strip --file "$_f" || warn "could not clean $_f; remove the downloads-guard entries by hand"
+  # Hook entries are found by the marker in their command; rules and patterns by their exact
+  # value, recomputed the way the installer wrote them.
+  strip_one() {  # strip_one FILE CMD...
+    _sf=$1
+    shift
+    if [ -f "$_sf" ] && grep -q downloads-guard "$_sf"; then
+      "$@" || warn "could not clean $_sf; remove the downloads-guard entries by hand"
     fi
-  done
+  }
+  strip_one "$CLAUDE_DIR/settings.json" with_denies jsonmerge strip --profile claude --file "$CLAUDE_DIR/settings.json"
+  strip_one "$CODEX_DIR/hooks.json" jsonmerge strip --profile codex --file "$CODEX_DIR/hooks.json"
+  strip_one "$CURSOR_DIR/hooks.json" jsonmerge strip --profile cursor-hooks --file "$CURSOR_DIR/hooks.json"
+  strip_one "$CURSOR_CLI_CONFIG" with_list --deny cursor_denies jsonmerge strip --profile cursor-cli --file "$CURSOR_CLI_CONFIG"
+  strip_one "$OPENCODE_DIR/opencode.json" with_list --pattern opencode_patterns jsonmerge strip --profile opencode --file "$OPENCODE_DIR/opencode.json"
   for _f in "$FISH_CONF" "$OPENCODE_DIR/plugins/downloads-guard.js" "$PI_DIR/extensions/downloads-guard.ts"; do
     if [ -e "$_f" ]; then run rm -f "$_f"; fi
   done
@@ -426,7 +488,7 @@ EOF
 if [ $UNINSTALL = 1 ]; then
   if [ ! -f "$MANIFEST" ]; then
     fallback_cleanup
-    [ -d "$DG_HOME" ] && run rm -rf "$DG_HOME"
+    remove_dg_home
     if [ $DRY = 1 ]; then say "Dry run: nothing was changed."; else say "downloads-guard removed. Open a new terminal so the shell wrappers are gone."; fi
     exit 0
   fi
@@ -499,32 +561,6 @@ if has fish || [ -d "${XDG_CONFIG_HOME:-$HOME/.config}/fish" ]; then
   record file fish "$FISH_CONF"
 fi
 
-hook_cmd() { printf '/bin/sh %s hook %s' "$(shq "$1")" "$2"; }
-DG_TILDE=$(tilde "$DG_HOME")
-
-claude_denies() {
-  # Narrow on purpose: memory, projects and everything else under ~/.claude stay writable.
-  printf '%s\n' "Edit(~/.claude.json)"
-  if [ "$CLAUDE_DIR" = "$HOME/.claude" ]; then
-    printf '%s\n' "Edit(~/.claude/settings*.json)"
-  else
-    printf '%s\n' "Edit(/$CLAUDE_DIR/settings*.json)"
-  fi
-  printf '%s\n' "Edit(**/.claude/settings*.json)" "Edit(**/.mcp.json)" "Edit($DG_TILDE/**)"
-}
-
-# with_denies CMD...: run CMD with "--deny RULE" appended for each Claude deny rule.
-with_denies() {
-  _old_ifs=$IFS
-  IFS=$NL
-  set -f
-  # shellcheck disable=SC2046 # split on newlines only, globbing off
-  set -- "$@" $(claude_denies | while IFS= read -r _l; do printf -- '--deny\n%s\n' "$_l"; done)
-  IFS=$_old_ifs
-  set +f
-  "$@"
-}
-
 json_apply() {  # json_apply NAME PROFILE FILE ARGS...
   _name=$1
   _profile=$2
@@ -552,9 +588,7 @@ fi
 if want_cursor; then
   say "Cursor: beforeSubmitPrompt hook in $CURSOR_DIR/hooks.json, Write denies in $CURSOR_CLI_CONFIG"
   json_apply cursor-hooks cursor-hooks "$CURSOR_DIR/hooks.json" --hook-command "$(hook_cmd "$CLI" cursor)"
-  json_apply cursor-cli cursor-cli "$CURSOR_CLI_CONFIG" \
-    --deny "Write($CURSOR_CLI_CONFIG)" --deny "Write($CURSOR_DIR/hooks.json)" \
-    --deny "Write($CURSOR_DIR/mcp.json)" --deny "Write($DG_HOME/**)"
+  with_list --deny cursor_denies json_apply cursor-cli cursor-cli "$CURSOR_CLI_CONFIG"
 fi
 if want_opencode; then
   say "OpenCode: plugin in $OPENCODE_DIR/plugins, edit denies in $OPENCODE_DIR/opencode.json"
@@ -565,8 +599,7 @@ if want_opencode; then
   if [ -f "$OPENCODE_DIR/opencode.jsonc" ] && [ ! -f "$OPENCODE_DIR/opencode.json" ]; then
     warn "$OPENCODE_DIR/opencode.jsonc has comments that downloads-guard cannot keep; add this by hand: \"permission\": {\"edit\": {\"$(tilde "$OPENCODE_DIR")/*\": \"deny\", \"$DG_TILDE/*\": \"deny\"}}"
   else
-    json_apply opencode opencode "$OPENCODE_DIR/opencode.json" \
-      --pattern "$(tilde "$OPENCODE_DIR")/*" --pattern "$DG_TILDE/*"
+    with_list --pattern opencode_patterns json_apply opencode opencode "$OPENCODE_DIR/opencode.json"
   fi
 fi
 if want_pi; then
@@ -622,9 +655,8 @@ if [ $SYSTEM = 1 ]; then
       say "would merge edit denies into $OPENCODE_MANAGED_DIR/opencode.json (as admin)"
     else
       priv mkdir -p "$OPENCODE_MANAGED_DIR"
-      priv python3 -I "$SYS_GUARD/lib/jsonmerge.py" apply --profile opencode-managed \
-        --file "$OPENCODE_MANAGED_DIR/opencode.json" --state "$_state" \
-        --pattern "$(tilde "$OPENCODE_DIR")/*" --pattern "$DG_TILDE/*" ||
+      with_list --pattern opencode_patterns priv python3 -I "$SYS_GUARD/lib/jsonmerge.py" apply \
+        --profile opencode-managed --file "$OPENCODE_MANAGED_DIR/opencode.json" --state "$_state" ||
         warn "could not update the OpenCode managed config"
     fi
     record sysjson opencode-managed "$OPENCODE_MANAGED_DIR/opencode.json" "$_state"
