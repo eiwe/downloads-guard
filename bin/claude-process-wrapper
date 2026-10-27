@@ -1,0 +1,5 @@
+#!/bin/sh
+# Set VS Code's claudeCode.claudeProcessWrapper to this file. The extension passes the
+# bundled claude binary as the first argument; it runs only outside protected folders.
+_dg_dir=$(CDPATH='' cd -P -- "$(dirname -- "$0")" && pwd -P) || exit 4
+exec /bin/sh "$_dg_dir/downloads-guard" wrap-exec "$@"
