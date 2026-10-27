@@ -351,8 +351,9 @@ else
   echo "skip zsh (not installed)"
 fi
 if command -v fish >/dev/null 2>&1; then
-  # fish keeps history and variables under XDG_DATA_HOME; keep those out of the test HOME.
-  run_fish() { (cd "$1" && env -i HOME="$H" PATH="$BASEPATH" LANG=C XDG_DATA_HOME="$TMP/fishdata" fish -c "$2"' -p "hello world" "" "a\"b" "\$HOME" "*"'); }
+  # fish keeps history, variables and caches under XDG_DATA_HOME and XDG_CACHE_HOME;
+  # keep those out of the test HOME.
+  run_fish() { (cd "$1" && env -i HOME="$H" PATH="$BASEPATH" LANG=C XDG_DATA_HOME="$TMP/fishdata" XDG_CACHE_HOME="$TMP/fishcache" fish -c "$2"' -p "hello world" "" "a\"b" "\$HOME" "*"'); }
   wrapper_case fish run_fish
 else
   echo "skip fish (not installed)"

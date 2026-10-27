@@ -219,6 +219,8 @@ try {
     $base = (Get-Item -LiteralPath $Dir).FullName
     $lines = foreach ($i in (Get-ChildItem -LiteralPath $Dir -Recurse -Force | Sort-Object FullName)) {
       $rel = $i.FullName.Substring($base.Length)
+      # PowerShell itself caches startup data under AppData of whatever USERPROFILE it runs with.
+      if ($rel -like '\AppData*') { continue }
       if ($i.PSIsContainer) { "$rel D" }
       else { "$rel F $([int](($i.Attributes -band [IO.FileAttributes]::ReadOnly) -ne 0)) $((Get-FileHash -LiteralPath $i.FullName -Algorithm SHA256).Hash)" }
     }
@@ -310,7 +312,9 @@ try {
   Eq 'installed Codex hook command (through cmd) blocks in Downloads' 2 (Invoke-ProcRaw $env:ComSpec ('/d /s /c "' + $cmdline + '"') $DL (CodexPrompt $DL)).Code
   Eq 'installed Codex hook command (through cmd) allows outside' 0 (Invoke-ProcRaw $env:ComSpec ('/d /s /c "' + $cmdline + '"') $Work (CodexPrompt $Work)).Code
   $cursorCmd = $cur.hooks.beforeSubmitPrompt[0].command
-  $r = Invoke-Proc $PS @('-NoProfile', '-NonInteractive', '-Command', "`$input | $cursorCmd; exit `$LASTEXITCODE") (Join-Path $H '.cursor') (CursorPrompt $DL)
+  $payload = Join-Path $TmpBase 'cursor-payload.json'
+  [IO.File]::WriteAllText($payload, (CursorPrompt $DL))
+  $r = Invoke-Proc $PS @('-NoProfile', '-NonInteractive', '-Command', "Get-Content -Raw -LiteralPath '$payload' | $cursorCmd; exit `$LASTEXITCODE") (Join-Path $H '.cursor')
   Eq 'installed Cursor hook command (through PowerShell) blocks in Downloads' 2 $r.Code
 
   Write-Host '# PowerShell wrappers'
