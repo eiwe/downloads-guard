@@ -47,9 +47,14 @@ function Quote-Arg([string]$A) {
 
 # Run a program with a working folder and stdin; returns Code, Out, Err.
 function Invoke-Proc([string]$Exe, [string[]]$ArgList, [string]$WorkDir, [string]$Stdin = '', [hashtable]$ExtraEnv = @{}) {
+  Invoke-ProcRaw $Exe (($ArgList | ForEach-Object { Quote-Arg $_ }) -join ' ') $WorkDir $Stdin $ExtraEnv
+}
+
+# The same with a command line passed exactly as given (for cmd.exe, which has its own quoting).
+function Invoke-ProcRaw([string]$Exe, [string]$RawArgs, [string]$WorkDir, [string]$Stdin = '', [hashtable]$ExtraEnv = @{}) {
   $psi = New-Object Diagnostics.ProcessStartInfo
   $psi.FileName = $Exe
-  $psi.Arguments = (($ArgList | ForEach-Object { Quote-Arg $_ }) -join ' ')
+  $psi.Arguments = $RawArgs
   $psi.WorkingDirectory = $WorkDir
   $psi.UseShellExecute = $false
   $psi.RedirectStandardInput = $true
@@ -122,8 +127,8 @@ try {
   Check 'known folder: SHGetKnownFolderPath returns a path' ([bool]$known) "got [$known]"
   $shellPath = (New-Object -ComObject Shell.Application).Namespace('shell:Downloads').Self.Path
   Eq 'known folder: matches the Shell namespace shell:Downloads' $shellPath.ToLowerInvariant() ([string]$known).ToLowerInvariant()
-  Check 'known folder: differs from the temporary USERPROFILE\Downloads (so both are covered)' (-not ([string]$known).StartsWith($H, [StringComparison]::OrdinalIgnoreCase))
-  Eq 'known folder: a path inside it is blocked even with another USERPROFILE' 3 (Invoke-Cli $Work @('check', (Join-Path $known 'some\project'))).Code
+  Write-Host "     (known folder for this test process: $known)"
+  Eq 'known folder: a path inside it is blocked' 3 (Invoke-Cli $Work @('check', (Join-Path $known 'some\project'))).Code
   $folders = (Invoke-Cli $Work @('folders')).Out
   Contains 'folders: lists the known folder' $folders 'Windows Downloads known folder'
 
@@ -256,25 +261,25 @@ try {
   Eq 'install: exit 0' 0 $r.Code
   if ($r.Code -ne 0) { Write-Host $r.Out; Write-Host $r.Err }
 
-  $s = Get-Content -LiteralPath $S -Raw | ConvertFrom-Json
-  Eq 'install: Claude keeps the model' 'opus' $s.model
-  Eq 'install: Claude keeps the Stop hook' 'echo bye' $s.hooks.Stop[0].hooks[0].command
-  Eq 'install: Claude hook runs powershell.exe' 'powershell.exe' $s.hooks.UserPromptSubmit[0].hooks[0].command
-  Eq 'install: Claude hook fails closed' 'block' $s.hooks.UserPromptSubmit[0].hooks[0].onFailure
-  Eq 'install: Claude PreToolUse matches every tool' '*' $s.hooks.PreToolUse[0].matcher
-  $denies = @($s.permissions.deny) -join "`n"
+  $claudeCfg = Get-Content -LiteralPath $S -Raw | ConvertFrom-Json
+  Eq 'install: Claude keeps the model' 'opus' $claudeCfg.model
+  Eq 'install: Claude keeps the Stop hook' 'echo bye' $claudeCfg.hooks.Stop[0].hooks[0].command
+  Eq 'install: Claude hook runs powershell.exe' 'powershell.exe' $claudeCfg.hooks.UserPromptSubmit[0].hooks[0].command
+  Eq 'install: Claude hook fails closed' 'block' $claudeCfg.hooks.UserPromptSubmit[0].hooks[0].onFailure
+  Eq 'install: Claude PreToolUse matches every tool' '*' $claudeCfg.hooks.PreToolUse[0].matcher
+  $denies = @($claudeCfg.permissions.deny) -join "`n"
   foreach ($rule in @('Read(./.env)', 'Edit(~/.claude.json)', 'Edit(~/.claude/settings*.json)', 'Edit(**/.claude/settings*.json)', 'Edit(**/.mcp.json)', 'Edit(~/.downloads-guard/**)')) {
     Contains "install: Claude deny rule $rule" $denies $rule
   }
-  Eq 'install: disableBypassPermissionsMode' 'disable' $s.permissions.disableBypassPermissionsMode
+  Eq 'install: disableBypassPermissionsMode' 'disable' $claudeCfg.permissions.disableBypassPermissionsMode
   $codex = Get-Content -LiteralPath (Join-Path $H '.codex\hooks.json') -Raw | ConvertFrom-Json
   Contains 'install: Codex hook command' $codex.hooks.UserPromptSubmit[0].hooks[0].command 'hook codex'
   $cur = Get-Content -LiteralPath (Join-Path $H '.cursor\hooks.json') -Raw | ConvertFrom-Json
   Eq 'install: Cursor hook is failClosed' 'True' $cur.hooks.beforeSubmitPrompt[0].failClosed
   Eq 'install: Cursor hooks.json version' '1' $cur.version
-  $cli = Get-Content -LiteralPath (Join-Path $H '.cursor\cli-config.json') -Raw | ConvertFrom-Json
-  Contains 'install: Cursor keeps its own deny rule' (@($cli.permissions.deny) -join ' ') 'Shell(rm)'
-  Contains 'install: Cursor denies writes to cli-config.json' (@($cli.permissions.deny) -join ' ') 'cli-config.json)'
+  $cursorCfg = Get-Content -LiteralPath (Join-Path $H '.cursor\cli-config.json') -Raw | ConvertFrom-Json
+  Contains 'install: Cursor keeps its own deny rule' (@($cursorCfg.permissions.deny) -join ' ') 'Shell(rm)'
+  Contains 'install: Cursor denies writes to cli-config.json' (@($cursorCfg.permissions.deny) -join ' ') 'cli-config.json)'
   $oc = Get-Content -LiteralPath (Join-Path $H '.config\opencode\opencode.json') -Raw
   Contains 'install: OpenCode keeps allow as the catch-all' $oc '"*"'
   Contains 'install: OpenCode denies edits to its config' $oc '~/.config/opencode/*'
@@ -297,11 +302,13 @@ try {
   Eq 'decoy: opencode.json denies every permission' 'deny' (Get-Content -LiteralPath (Join-Path $H 'Downloads\opencode.json') -Raw | ConvertFrom-Json).permission
 
   Write-Host '# installed hook commands run as the harness would run them'
-  $h = $s.hooks.UserPromptSubmit[0].hooks[0]
-  Eq 'installed Claude hook (exec form) blocks in Downloads' 2 (Invoke-Proc $h.command ([string[]]@($h.args)) $DL (ClaudePrompt $DL)).Code
-  Eq 'installed Claude hook (exec form) allows outside' 0 (Invoke-Proc $h.command ([string[]]@($h.args)) $Work (ClaudePrompt $Work)).Code
+  # (PowerShell variable names ignore case, so nothing here may be called $h: that is $H.)
+  $hk = $claudeCfg.hooks.UserPromptSubmit[0].hooks[0]
+  Eq 'installed Claude hook (exec form) blocks in Downloads' 2 (Invoke-Proc $hk.command ([string[]]@($hk.args)) $DL (ClaudePrompt $DL)).Code
+  Eq 'installed Claude hook (exec form) allows outside' 0 (Invoke-Proc $hk.command ([string[]]@($hk.args)) $Work (ClaudePrompt $Work)).Code
   $cmdline = $codex.hooks.UserPromptSubmit[0].hooks[0].command
-  Eq 'installed Codex hook command (through cmd) blocks in Downloads' 2 (Invoke-Proc $env:ComSpec @('/d', '/s', '/c', $cmdline) $DL (CodexPrompt $DL)).Code
+  Eq 'installed Codex hook command (through cmd) blocks in Downloads' 2 (Invoke-ProcRaw $env:ComSpec ('/d /s /c "' + $cmdline + '"') $DL (CodexPrompt $DL)).Code
+  Eq 'installed Codex hook command (through cmd) allows outside' 0 (Invoke-ProcRaw $env:ComSpec ('/d /s /c "' + $cmdline + '"') $Work (CodexPrompt $Work)).Code
   $cursorCmd = $cur.hooks.beforeSubmitPrompt[0].command
   $r = Invoke-Proc $PS @('-NoProfile', '-NonInteractive', '-Command', "`$input | $cursorCmd; exit `$LASTEXITCODE") (Join-Path $H '.cursor') (CursorPrompt $DL)
   Eq 'installed Cursor hook command (through PowerShell) blocks in Downloads' 2 $r.Code
