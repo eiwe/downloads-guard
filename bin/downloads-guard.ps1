@@ -10,6 +10,13 @@
 # Exit codes: 0 allowed, 3 blocked, 4 could not decide (callers treat 4 as blocked).
 
 $ErrorActionPreference = 'Stop'
+
+# When Windows PowerShell 5.1 is started from PowerShell 7 (a pwsh terminal, or an agent
+# launched from one), it inherits PowerShell 7 module folders and then fails to load
+# built-in modules. Keep only the Windows PowerShell module folders.
+if ($PSVersionTable.PSEdition -eq 'Desktop' -and $env:PSModulePath) {
+  $env:PSModulePath = (($env:PSModulePath -split ';') | Where-Object { $_ -and $_ -notmatch '[\\/]PowerShell[\\/]' }) -join ';'
+}
 $DGExitBlocked = 3
 $DGExitError = 4
 $DGRoot = Split-Path -Parent $PSScriptRoot
@@ -113,7 +120,7 @@ function Invoke-Status {
   $hit = Find-DGProtectedHit -Paths (Get-DGCurrentFolders)
   if ($hit) { [Console]::Out.WriteLine("Current folder: $($hit.Dir) -> BLOCKED (inside $($hit.Root))") }
   else { [Console]::Out.WriteLine("Current folder: $((Get-DGCurrentFolders)[0]) -> allowed") }
-  $policy = Get-ExecutionPolicy
+  $policy = try { [string](Get-ExecutionPolicy) } catch { 'unknown' }
   if (@('Restricted', 'AllSigned') -contains [string]$policy) {
     [Console]::Out.WriteLine("Execution policy: $policy. PowerShell profiles do not run, so the wrappers are NOT active. Run: Set-ExecutionPolicy -Scope CurrentUser RemoteSigned")
   } else {

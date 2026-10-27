@@ -11,6 +11,13 @@
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 
+# When Windows PowerShell 5.1 is started from PowerShell 7 (a pwsh terminal, or an agent
+# launched from one), it inherits PowerShell 7 module folders and then fails to load
+# built-in modules. Keep only the Windows PowerShell module folders.
+if ($PSVersionTable.PSEdition -eq 'Desktop' -and $env:PSModulePath) {
+  $env:PSModulePath = (($env:PSModulePath -split ';') | Where-Object { $_ -and $_ -notmatch '[\\/]PowerShell[\\/]' }) -join ';'
+}
+
 $DryRun = $false
 $Uninstall = $false
 $SystemTier = $false
@@ -732,7 +739,7 @@ if (-not $DryRun -and (Get-Command Unblock-File -ErrorAction SilentlyContinue)) 
 
 # Layer 1: PowerShell wrappers.
 foreach ($p in $ProfilePaths) { Add-ProfileBlock $p }
-$policy = [string](Get-ExecutionPolicy)
+$policy = try { [string](Get-ExecutionPolicy) } catch { 'unknown' }
 if (@('Restricted', 'AllSigned') -contains $policy) {
   Warn "the PowerShell execution policy is $policy, so profiles do not run and the wrappers stay inactive. To fix: Set-ExecutionPolicy -Scope CurrentUser RemoteSigned"
 }
