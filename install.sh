@@ -8,7 +8,7 @@
 #
 # Running it again updates an existing install in place.
 
-# shellcheck disable=SC2088,SC2015 # "~/..." strings are written for the harnesses to expand
+# shellcheck disable=SC2088,SC2015,SC2016 # "~/..." strings are written for the harnesses to expand
 set -u
 unset CDPATH
 umask 022
@@ -215,6 +215,7 @@ else
 fi
 OPENCODE_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/opencode
 PI_DIR=${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}
+FISH_CONF=${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/downloads-guard.fish
 
 want_claude() { [ -d "$CLAUDE_DIR" ] || has claude; }
 want_codex() { [ -d "$CODEX_DIR" ] || has codex; }
@@ -244,15 +245,18 @@ remove_block() {  # remove_block FILE CREATED(yes|no)
   fi
 }
 
-add_block() {  # add_block FILE NAME
+add_block() {  # add_block FILE NAME [bash-only]
   _f=$1
   _created=no
   [ -e "$_f" ] || _created=yes
   remove_block "$_f" no
+  # ~/.profile is also read by other sh-family shells; load the bash/zsh wrappers only in bash.
+  _cond=
+  [ "${3:-}" = bash-only ] && _cond='[ -n "${BASH_VERSION:-}" ] && '
   _body="$MARK_BEGIN
 # Added by downloads-guard. Remove with: ~/.downloads-guard/install.sh --uninstall
 _dg_cli=$(shq "$CLI")
-[ -r $(shq "$DG_HOME/shell/guard.sh") ] && . $(shq "$DG_HOME/shell/guard.sh")
+${_cond}[ -r $(shq "$DG_HOME/shell/guard.sh") ] && . $(shq "$DG_HOME/shell/guard.sh")
 $MARK_END"
   if [ $DRY = 1 ]; then
     say "would add to $_f:"
@@ -273,7 +277,7 @@ SQUAT_NAMES="AGENTS.md CLAUDE.md CLAUDE.local.md AGENTS.override.md"
 
 is_our_squat() {  # is_our_squat PATH
   case $1 in
-    */opencode.json) cmp -s "$1" "$DG_SRC/templates/opencode.json" ;;
+    */opencode.json | */opencode.jsonc) cmp -s "$1" "$DG_SRC/templates/opencode.json" ;;
     *) grep -q 'downloads-guard:squat' "$1" 2>/dev/null ;;
   esac
 }
@@ -296,9 +300,12 @@ install_squats() {
       continue
     fi
     _any=1
-    for _n in $SQUAT_NAMES opencode.json; do
+    for _n in $SQUAT_NAMES opencode.json opencode.jsonc; do
       _p=$_d/$_n
-      if [ "$_n" = opencode.json ]; then _tpl=$DG_SRC/templates/opencode.json; else _tpl=$DG_SRC/templates/squat.md; fi
+      case $_n in
+        opencode.json*) _tpl=$DG_SRC/templates/opencode.json ;;
+        *) _tpl=$DG_SRC/templates/squat.md ;;
+      esac
       if [ -e "$_p" ] && ! is_our_squat "$_p"; then
         warn "$_p already exists and was not made by downloads-guard. Look at it (it may be the kind of file this tool guards against), delete it, and run the installer again."
         record squat-foreign "$_n" "$_p"
@@ -345,7 +352,12 @@ uninstall_from_manifest() {
           if [ $DRY = 1 ]; then
             say "would revert $_path (as admin)"
           else
-            priv python3 -I "$DG_SRC/lib/jsonmerge.py" revert --state "$_extra"
+            # The admin-owned copy, never the user-writable one, runs as root.
+            if [ -f "$SYS_GUARD/lib/jsonmerge.py" ]; then
+              priv python3 -I "$SYS_GUARD/lib/jsonmerge.py" revert --state "$_extra"
+            else
+              warn "$SYS_GUARD/lib/jsonmerge.py is missing; remove the downloads-guard entries from $_path by hand (as admin)"
+            fi
           fi
           ;;
         sysfile) priv rm -f "$_path" ;;
@@ -377,9 +389,45 @@ uninstall_all() {  # uninstall_all KEEP_CONFIG(0|1)
   fi
 }
 
+# Without an install record (for example after ~/.downloads-guard was deleted by hand), find
+# downloads-guard's entries by their marker in every place the installer writes to. Left in
+# place, hooks that point at a missing check would block every agent everywhere.
+fallback_cleanup() {
+  say "No install record found; removing downloads-guard entries from every place the installer writes to."
+  for _f in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile" "${ZDOTDIR:-$HOME}/.zshrc"; do
+    remove_block "$_f" no
+  done
+  for _f in "$CLAUDE_DIR/settings.json" "$CODEX_DIR/hooks.json" "$CURSOR_DIR/hooks.json" "$CURSOR_CLI_CONFIG" "$OPENCODE_DIR/opencode.json"; do
+    if [ -f "$_f" ] && grep -q downloads-guard "$_f"; then
+      jsonmerge strip --file "$_f" || warn "could not clean $_f; remove the downloads-guard entries by hand"
+    fi
+  done
+  for _f in "$FISH_CONF" "$OPENCODE_DIR/plugins/downloads-guard.js" "$PI_DIR/extensions/downloads-guard.ts"; do
+    if [ -e "$_f" ]; then run rm -f "$_f"; fi
+  done
+  _dirs=$(sh "$DG_SRC/bin/downloads-guard" downloads-dirs 2>/dev/null) || _dirs=
+  while IFS= read -r _d; do
+    [ -n "$_d" ] && [ -d "$_d" ] || continue
+    for _n in $SQUAT_NAMES opencode.json opencode.jsonc; do
+      if [ -e "$_d/$_n" ] && is_our_squat "$_d/$_n"; then
+        user_unlock "$_d/$_n"
+        run rm -f "$_d/$_n"
+      fi
+    done
+  done <<EOF
+$_dirs
+EOF
+  for _f in "$CLAUDE_DROPIN" "$SYS_GUARD"; do
+    [ -e "$_f" ] && warn "$_f is still there (from --system); remove it as admin"
+  done
+  return 0
+}
+
 if [ $UNINSTALL = 1 ]; then
-  if [ ! -d "$DG_HOME" ]; then
-    say "downloads-guard is not installed (no $DG_HOME)."
+  if [ ! -f "$MANIFEST" ]; then
+    fallback_cleanup
+    [ -d "$DG_HOME" ] && run rm -rf "$DG_HOME"
+    if [ $DRY = 1 ]; then say "Dry run: nothing was changed."; else say "downloads-guard removed. Open a new terminal so the shell wrappers are gone."; fi
     exit 0
   fi
   uninstall_all 0
@@ -432,13 +480,19 @@ fi
 
 # Layer 1: shell wrappers.
 add_block "$HOME/.bashrc" bash
-if [ "$OS" = Darwin ] && [ -f "$HOME/.bash_profile" ]; then
-  add_block "$HOME/.bash_profile" bash-login
+if [ "$OS" = Darwin ]; then
+  # Terminal on macOS starts login shells, which read the first of these that exists.
+  if [ -f "$HOME/.bash_profile" ]; then
+    add_block "$HOME/.bash_profile" bash-login
+  elif [ -f "$HOME/.bash_login" ]; then
+    add_block "$HOME/.bash_login" bash-login
+  else
+    add_block "$HOME/.profile" bash-login bash-only
+  fi
 fi
 if has zsh || [ -f "${ZDOTDIR:-$HOME}/.zshrc" ]; then
   add_block "${ZDOTDIR:-$HOME}/.zshrc" zsh
 fi
-FISH_CONF=${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/downloads-guard.fish
 if has fish || [ -d "${XDG_CONFIG_HOME:-$HOME/.config}/fish" ]; then
   note_dirs "$FISH_CONF"
   gen_fish | write_file "$FISH_CONF" 644
@@ -568,7 +622,7 @@ if [ $SYSTEM = 1 ]; then
       say "would merge edit denies into $OPENCODE_MANAGED_DIR/opencode.json (as admin)"
     else
       priv mkdir -p "$OPENCODE_MANAGED_DIR"
-      priv python3 -I "$DG_SRC/lib/jsonmerge.py" apply --profile opencode-managed \
+      priv python3 -I "$SYS_GUARD/lib/jsonmerge.py" apply --profile opencode-managed \
         --file "$OPENCODE_MANAGED_DIR/opencode.json" --state "$_state" \
         --pattern "$(tilde "$OPENCODE_DIR")/*" --pattern "$DG_TILDE/*" ||
         warn "could not update the OpenCode managed config"

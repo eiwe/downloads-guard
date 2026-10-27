@@ -497,7 +497,13 @@ function Get-ClaudeHandler([string]$CliPath) {
 function Get-ClaudeDenies {
   $list = @('Edit(~/.claude.json)')
   if ($ClaudeDir -eq (Join-Path $UserHome '.claude')) { $list += 'Edit(~/.claude/settings*.json)' }
-  else { $list += ('Edit(//' + ($ClaudeDir -replace '\\', '/').TrimStart('/') + '/settings*.json)') }
+  else {
+    # Claude permission rules write an absolute Windows path as //c/Users/... (drive letter, no colon).
+    $cd = $ClaudeDir -replace '\\', '/'
+    if ($cd -match '^([A-Za-z]):/(.*)$') { $cd = '//' + $Matches[1].ToLowerInvariant() + '/' + $Matches[2] }
+    else { $cd = '//' + $cd.TrimStart('/') }
+    $list += ('Edit(' + $cd.TrimEnd('/') + '/settings*.json)')
+  }
   $list += 'Edit(**/.claude/settings*.json)', 'Edit(**/.mcp.json)', 'Edit(~/.downloads-guard/**)'
   return $list
 }
@@ -509,8 +515,7 @@ function Get-ClaudeOps([string]$CliPath) {
   return @(
     (New-Op 'hook' @('hooks', 'UserPromptSubmit') $prompt),
     (New-Op 'hook' @('hooks', 'PreToolUse') $tool),
-    (New-Op 'array_add' @('permissions', 'deny') (Get-ClaudeDenies)),
-    (New-Op 'set' @('permissions', 'disableBypassPermissionsMode') 'disable')
+    (New-Op 'array_add' @('permissions', 'deny') (Get-ClaudeDenies))
   )
 }
 
@@ -590,12 +595,12 @@ function Add-ProfileBlock([string]$File) {
 
 # ------------------------------------------------------------------ layer 3 decoys
 
-$SquatNames = @('AGENTS.md', 'CLAUDE.md', 'CLAUDE.local.md', 'AGENTS.override.md', 'opencode.json')
+$SquatNames = @('AGENTS.md', 'CLAUDE.md', 'CLAUDE.local.md', 'AGENTS.override.md', 'opencode.json', 'opencode.jsonc')
 
 function Test-OurSquat([string]$Path) {
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
   $text = [IO.File]::ReadAllText($Path)
-  if ($Path.EndsWith('opencode.json', [StringComparison]::OrdinalIgnoreCase)) {
+  if ($Path.EndsWith('opencode.json', [StringComparison]::OrdinalIgnoreCase) -or $Path.EndsWith('opencode.jsonc', [StringComparison]::OrdinalIgnoreCase)) {
     return ($text -eq [IO.File]::ReadAllText((Join-Path (Join-Path $Src 'templates') 'opencode.json')))
   }
   return $text.Contains('downloads-guard:squat')
@@ -618,7 +623,7 @@ function Install-Squats {
     $any = $true
     foreach ($n in $SquatNames) {
       $p = Join-Path $d $n
-      $tpl = if ($n -eq 'opencode.json') { Join-Path (Join-Path $Src 'templates') 'opencode.json' } else { Join-Path (Join-Path $Src 'templates') 'squat.md' }
+      $tpl = if ($n -like 'opencode.json*') { Join-Path (Join-Path $Src 'templates') 'opencode.json' } else { Join-Path (Join-Path $Src 'templates') 'squat.md' }
       if ((Test-Path -LiteralPath $p) -and -not (Test-OurSquat $p)) {
         Warn "$p already exists and was not made by downloads-guard. Look at it (it may be the kind of file this tool guards against), delete it, and run the installer again."
         Add-Record 'squat-foreign' $n $p
@@ -693,8 +698,65 @@ function Invoke-UninstallAll([bool]$KeepConfig) {
   }
 }
 
+# Remove downloads-guard entries without a state file: hook handlers in hook lists, and list
+# items and object keys that carry the marker. Containers emptied by this are removed.
+function Remove-DGMarked($Value, [bool]$UnderHooks) {
+  if ($Value -is [System.Collections.IDictionary]) {
+    foreach ($k in @($Value.Keys)) {
+      if (([string]$k).Contains('downloads-guard')) { $Value.Remove($k); continue }
+      $v = $Value[$k]
+      $isColl = ($v -is [System.Collections.ICollection]) -and -not ($v -is [string])
+      $before = if ($isColl) { $v.Count } else { 0 }
+      Remove-DGMarked $v ($UnderHooks -or $k -eq 'hooks')
+      if ($isColl -and $before -gt 0 -and $v.Count -eq 0) { $Value.Remove($k) }
+    }
+  } elseif (($Value -is [System.Collections.IList]) -and -not ($Value -is [string])) {
+    if ($UnderHooks) { Remove-MarkedHooks $Value }
+    else { for ($i = $Value.Count - 1; $i -ge 0; $i--) { if (Test-HasMarker $Value[$i]) { $Value.RemoveAt($i) } } }
+  }
+}
+
+# Without an install record (for example after the install folder was deleted by hand), find
+# downloads-guard's entries by their marker in every place the installer writes to. Left in
+# place, hooks that point at a missing check would block every agent everywhere.
+function Invoke-FallbackCleanup {
+  Say 'No install record found; removing downloads-guard entries from every place the installer writes to.'
+  foreach ($p in $ProfilePaths) { Remove-ProfileBlock $p $false }
+  foreach ($f in @((Join-Path $ClaudeDir 'settings.json'), (Join-Path $CodexDir 'hooks.json'), (Join-Path $CursorDir 'hooks.json'),
+      $CursorCli, (Join-Path $OpenCodeDir 'opencode.json'))) {
+    if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { continue }
+    $text = [IO.File]::ReadAllText($f, $Utf8)
+    if (-not $text.Contains('downloads-guard')) { continue }
+    try {
+      $doc = Read-JsonText $text $f
+      Remove-DGMarked $doc $false
+      if ($DryRun) { Say "would remove downloads-guard entries from ${f}:"; Say (ConvertTo-JsonText $doc).TrimEnd() }
+      else { Write-TextAtomic $f (ConvertTo-JsonText $doc); Say "removed downloads-guard entries from $f" }
+    } catch { Warn "could not clean $f ($($_.Exception.Message)); remove the downloads-guard entries by hand" }
+  }
+  foreach ($f in @((Join-Path (Join-Path $OpenCodeDir 'plugins') 'downloads-guard.js'), (Join-Path (Join-Path $PiDir 'extensions') 'downloads-guard.ts'))) {
+    Remove-FileChange $f
+  }
+  Import-Module (Join-Path (Join-Path $Src 'lib') 'DownloadsGuard.psm1') -Force -DisableNameChecking
+  foreach ($d in @(Get-DGDownloadsFolders | ForEach-Object { ConvertTo-DGFullPath $_.Path })) {
+    if (-not (Test-Path -LiteralPath $d -PathType Container)) { continue }
+    foreach ($n in $SquatNames) {
+      $p = Join-Path $d $n
+      if (Test-OurSquat $p) { Set-ReadOnly $p $false; Remove-FileChange $p }
+    }
+  }
+  foreach ($f in @($ClaudeDropin, $SysGuard)) {
+    if (Test-Path -LiteralPath $f) { Warn "$f is still there (from --system); remove it from an elevated PowerShell" }
+  }
+}
+
 if ($Uninstall) {
-  if (-not (Test-Path -LiteralPath $DGHome)) { Say "downloads-guard is not installed (no $DGHome)."; exit 0 }
+  if (-not (Test-Path -LiteralPath $Manifest)) {
+    Invoke-FallbackCleanup
+    Remove-FileChange $DGHome
+    if ($DryRun) { Say 'Dry run: nothing was changed.' } else { Say 'downloads-guard removed. Open a new PowerShell window so the wrappers are gone.' }
+    exit 0
+  }
   # Run from a copy outside the install folder, which is about to be deleted.
   Invoke-UninstallAll $false
   if ($DryRun) { Say 'Dry run: nothing was changed.' } else { Say 'downloads-guard removed. Open a new PowerShell window so the wrappers are gone.' }

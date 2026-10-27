@@ -13,6 +13,7 @@ Usage:
   jsonmerge.py apply  --profile NAME --file PATH --state PATH [profile options] [--dry-run]
   jsonmerge.py revert --state PATH [--dry-run]
   jsonmerge.py render --profile claude-managed --hook-command CMD [--deny RULE ...]
+  jsonmerge.py strip  --file PATH [--dry-run]   (no state file: remove marker-bearing entries)
 """
 
 import argparse
@@ -224,7 +225,6 @@ def profile_ops(args):
         ]
         if args.deny:
             ops.append(("array_add", ["permissions", "deny"], args.deny))
-        ops.append(("set", ["permissions", "disableBypassPermissionsMode"], "disable"))
         return ops
     if p == "codex":
         h = {"type": "command", "command": args.hook_command, "timeout": 30}
@@ -409,6 +409,50 @@ def cmd_revert(args):
     return 0
 
 
+def strip_marked(value, under_hooks=False):
+    """Remove every downloads-guard entry without a state file: hook handlers in hook lists,
+    list items and object keys that carry the marker. Containers left empty by this are
+    removed. Returns (new_value, changed)."""
+    if isinstance(value, dict):
+        out = {}
+        changed = False
+        for k, v in value.items():
+            if MARKER in k:
+                changed = True
+                continue
+            nv, ch = strip_marked(v, under_hooks or k == "hooks")
+            if ch and isinstance(nv, (dict, list)) and len(nv) == 0:
+                changed = True
+                continue
+            out[k] = nv
+            changed = changed or ch
+        return out, changed
+    if isinstance(value, list):
+        if under_hooks:
+            cleaned, removed = strip_marked_hooks(value)
+            return cleaned, removed > 0
+        out = [v for v in value if not has_marker(v)]
+        return out, len(out) != len(value)
+    return value, False
+
+
+def cmd_strip(args):
+    path = os.path.abspath(args.file)
+    if not os.path.exists(path):
+        return 0
+    doc = load_json(path)
+    new, changed = strip_marked(doc)
+    if not changed:
+        return 0
+    if args.dry_run:
+        print("would remove downloads-guard entries from %s:" % path)
+        print(json.dumps(new, indent=2, ensure_ascii=False))
+        return 0
+    atomic_write_json(path, new, file_mode(path))
+    print("removed downloads-guard entries from %s" % path)
+    return 0
+
+
 def cmd_render(args):
     if args.profile != "claude-managed":
         raise MergeError("render supports only claude-managed")
@@ -426,7 +470,7 @@ def cmd_render(args):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="jsonmerge.py")
-    ap.add_argument("action", choices=["apply", "revert", "render"])
+    ap.add_argument("action", choices=["apply", "revert", "render", "strip"])
     ap.add_argument("--profile")
     ap.add_argument("--file")
     ap.add_argument("--state")
@@ -441,6 +485,10 @@ def main(argv=None):
             if not (args.profile and args.file and args.state):
                 ap.error("apply needs --profile, --file and --state")
             return cmd_apply(args)
+        if args.action == "strip":
+            if not args.file:
+                ap.error("strip needs --file")
+            return cmd_strip(args)
         if args.action == "revert":
             if not args.state:
                 ap.error("revert needs --state")
